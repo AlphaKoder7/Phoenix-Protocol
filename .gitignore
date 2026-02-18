@@ -1,0 +1,93 @@
+# ==============================================================
+# Phoenix Protocol — .gitignore
+# ==============================================================
+
+# --------------------------------------------------------------
+# Terraform
+# --------------------------------------------------------------
+
+# Local .terraform directory (provider binaries, modules cache)
+**/.terraform/
+
+# Terraform state files — NEVER commit state (contains secrets)
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+
+# Terraform plan output files
+*.tfplan
+
+# Terraform variable files that may contain secrets
+*.tfvars
+*.tfvars.json
+
+# Terraform lock file (optional: some teams commit this)
+# .terraform.lock.hcl
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Override files (local developer overrides)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# --------------------------------------------------------------
+# Python
+# --------------------------------------------------------------
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Compiled bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# Environment variable files — NEVER commit secrets
+.env
+.env.*
+!.env.example
+
+# Jupyter Notebooks (if any)
+.ipynb_checkpoints/
+
+# --------------------------------------------------------------
+# OS & Editor Artifacts
+# --------------------------------------------------------------
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
+
+# JetBrains IDEs
+.idea/
+
+# --------------------------------------------------------------
+# Logs
+# --------------------------------------------------------------
+*.log
+logs/
