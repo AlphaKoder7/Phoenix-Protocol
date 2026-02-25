@@ -1,0 +1,133 @@
+# ==============================================================================
+# Phoenix Protocol — Automated DR Drill Pipeline
+# ==============================================================================
+# Triggers:
+#   - Scheduled: Every Sunday at 02:00 UTC
+#   - Manual:    workflow_dispatch (for testing)
+#
+# Flow: checkout → install tools → install ODBC driver → tf apply
+#       → pip install → run drill script → tf destroy (ALWAYS)
+# ==============================================================================
+
+name: Phoenix Protocol - DR Drill
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'   # Every Sunday at 02:00 UTC
+  workflow_dispatch:        # Allow manual trigger for testing
+
+jobs:
+  phoenix-drill:
+    name: Execute DR Drill
+    runs-on: ubuntu-latest
+
+    # Permissions kept minimal; add 'id-token: write' here if you migrate
+    # to OIDC (Federated Identity) in the future — see TODO.md Future Scope.
+    permissions:
+      contents: read
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── 2. Install Terraform ─────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.x"
+
+      # ── 3. Install Python 3.10 ───────────────────────────────────────────────
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # ── 4. Install ODBC Driver 18 for SQL Server ─────────────────────────────
+      # pyodbc requires msodbcsql18 to be present on the runner OS.
+      # The package is available via the official Microsoft APT repository.
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          # Import the Microsoft signing key
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+
+          # Add the Microsoft APT repository for Ubuntu 22.04 (ubuntu-latest)
+          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list
+
+          # Refresh package lists and install the driver
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
+
+      # ── 5. Install Python Dependencies ───────────────────────────────────────
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+
+      # ── 6. Terraform Init & Apply — Provision Ephemeral Drill Environment ────
+      - name: Terraform Init & Apply
+        id: tf_apply
+        working-directory: ./infrastructure
+        env:
+          # AzureRM provider authentication — read from GitHub Secrets
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.SUBSCRIPTION_ID }}
+        run: |
+          terraform init
+
+          terraform apply -auto-approve \
+            -var="run_id=${{ github.run_id }}" \
+            -var="sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}"
+
+          # ── Capture Terraform outputs into GITHUB_ENV ──────────────────────
+          # These values are consumed by the drill script in the next step.
+          echo "DRILL_SQL_SERVER_FQDN=$(terraform output -raw sql_server_fqdn)" \
+            >> $GITHUB_ENV
+          echo "DRILL_SQL_SERVER_NAME=$(terraform output -raw drill_sql_server_name)" \
+            >> $GITHUB_ENV
+          echo "DRILL_RESOURCE_GROUP=$(terraform output -raw resource_group_name)" \
+            >> $GITHUB_ENV
+
+      # ── 7. Run Phoenix Drill Script ───────────────────────────────────────────
+      - name: Run Phoenix Drill (drill_master.py)
+        run: python scripts/drill_master.py
+        env:
+          # ── Azure Service Principal Identity ───────────────────────────────
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID:     ${{ secrets.SUBSCRIPTION_ID }}
+
+          # ── Production Source Database (backup target) ─────────────────────
+          PROD_SQL_SERVER_NAME: ${{ secrets.PROD_SQL_SERVER_NAME }}
+          PROD_DB_NAME:         ${{ secrets.PROD_DB_NAME }}
+          PROD_RESOURCE_GROUP:  ${{ secrets.PROD_RESOURCE_GROUP }}
+
+          # ── Drill Target — populated from Terraform outputs (Step 6) ───────
+          DRILL_SQL_SERVER_FQDN: ${{ env.DRILL_SQL_SERVER_FQDN }}
+          DRILL_SQL_SERVER_NAME: ${{ env.DRILL_SQL_SERVER_NAME }}
+          DRILL_RESOURCE_GROUP:  ${{ env.DRILL_RESOURCE_GROUP }}
+
+          # ── Drill SQL Server Credentials ───────────────────────────────────
+          # SQL_ADMIN_USERNAME default matches variables.tf: "phoenix-admin"
+          SQL_ADMIN_USERNAME: "phoenix-admin"
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+
+      # ── 8. Terraform Destroy — CRITICAL: ALWAYS RUNS ─────────────────────────
+      # This step uses `if: always()` to guarantee that ephemeral Azure resources
+      # (the drill SQL Server and its Resource Group) are torn down regardless
+      # of whether the drill script above passed or failed. This prevents
+      # "zombie resources" and satisfies the cost NFR (< $0.05 per run).
+      - name: Terraform Destroy (Cleanup)
+        if: always()
+        working-directory: ./infrastructure
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.SUBSCRIPTION_ID }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="run_id=${{ github.run_id }}" \
+            -var="sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}"
