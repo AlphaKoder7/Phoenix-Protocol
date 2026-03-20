@@ -6,7 +6,7 @@ variable "run_id" {
 variable "location" {
   description = "Azure region where the drill environment will be provisioned."
   type        = string
-  default     = "East US"
+  default     = "West US 2"
 }
 
 variable "sql_admin_username" {
