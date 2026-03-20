@@ -2,7 +2,7 @@
 drill_master.py — Phoenix Protocol Core Script
 ================================================
 Performs the "Game Day" DR drill cycle:
-  Step A: Identify the latest restore point of the Production database.
+  Step A: Read earliest_restore_date from the Production database object.
   Step B: Restore it to the ephemeral Drill SQL Server.
   Step C: Verify data integrity via a row-count query.
 
@@ -65,7 +65,7 @@ EXPECTED_ROW_THRESHOLD = 1
 
 
 # ──────────────────────────────────────────────────────────────
-# Step A: Authenticate & Identify Latest Restore Point
+# Step A: Authenticate & Identify PITR Target Time
 # ──────────────────────────────────────────────────────────────
 
 def authenticate() -> SqlManagementClient:
@@ -83,64 +83,44 @@ def authenticate() -> SqlManagementClient:
 
 def get_latest_restore_point(client: SqlManagementClient) -> object:
     """
-    Query the production database's restore points and return the most recent one.
+    Return the PITR target time for the production database.
 
-    Restore points whose `restore_point_creation_date` is None are silently
-    skipped — this happens when the initial Azure backup is still being generated
-    (the object exists in the list but the timestamp has not been populated yet).
+    Reads `earliest_restore_date` directly from the Database object via
+    `databases.get()`. This property is the canonical, authoritative timestamp
+    that the Azure Portal also surfaces, and is always consistent with the
+    service's internal PITR window — unlike `restore_points.list_by_database()`,
+    which can return objects with a null `restore_point_creation_date` while the
+    initial backup is still being written.
 
-    Raises RuntimeError if no restore points exist at all, or if every restore
-    point has a null creation date (backup generation still in progress).
+    Raises RuntimeError if `earliest_restore_date` is None, meaning the
+    production database has not yet completed its first automated backup.
     """
-    print(f"[STEP A] Fetching restore points for '{PROD_DB_NAME}' on '{PROD_SQL_SERVER_NAME}'...")
-
-    all_restore_points = list(
-        client.restore_points.list_by_database(
-            resource_group_name=PROD_RESOURCE_GROUP,
-            server_name=PROD_SQL_SERVER_NAME,
-            database_name=PROD_DB_NAME,
-        )
+    print(
+        f"[STEP A] Fetching database object for '{PROD_DB_NAME}' "
+        f"on '{PROD_SQL_SERVER_NAME}'..."
     )
 
-    if not all_restore_points:
+    prod_db = client.databases.get(
+        resource_group_name=PROD_RESOURCE_GROUP,
+        server_name=PROD_SQL_SERVER_NAME,
+        database_name=PROD_DB_NAME,
+    )
+
+    restore_time = prod_db.earliest_restore_date
+
+    if restore_time is None:
         raise RuntimeError(
-            f"No restore points found for database '{PROD_DB_NAME}'. "
-            "Ensure the production database has backups enabled and has been "
-            "running long enough to generate a restore point."
-        )
-
-    # Filter out entries where the timestamp is None (backup still generating)
-    valid_restore_points = [
-        rp for rp in all_restore_points
-        if rp.restore_point_creation_date is not None
-    ]
-
-    total   = len(all_restore_points)
-    skipped = total - len(valid_restore_points)
-    if skipped:
-        print(
-            f"[STEP A] Skipped {skipped}/{total} restore point(s) with a null "
-            "creation date (initial backup still generating)."
-        )
-
-    # Guard: if every restore point had a null date, bail with a clear message
-    if not valid_restore_points:
-        raise RuntimeError(
-            f"All {total} restore point(s) for '{PROD_DB_NAME}' have a null "
-            "restore_point_creation_date. The initial Azure backup is still being "
-            "generated. Re-run the drill once the first backup completes "
+            f"'earliest_restore_date' is None for database '{PROD_DB_NAME}'. "
+            "The initial Azure automated backup has not yet completed. "
+            "Re-run the drill once the first backup finishes "
             "(typically within 60 minutes of database creation)."
         )
-
-    # Pick the most recent valid restore point
-    latest = max(valid_restore_points, key=lambda rp: rp.restore_point_creation_date)
-    restore_time = latest.restore_point_creation_date
 
     # Ensure the datetime is timezone-aware (Azure SDK returns UTC-naive datetimes)
     if restore_time.tzinfo is None:
         restore_time = restore_time.replace(tzinfo=timezone.utc)
 
-    print(f"[STEP A] Latest restore point identified: {restore_time.isoformat()}")
+    print(f"[STEP A] PITR target time (earliest_restore_date): {restore_time.isoformat()}")
     return restore_time
 
 
@@ -256,7 +236,7 @@ def main() -> None:
 
     start_time = time.time()
 
-    # Step A: Auth + identify restore point
+    # Step A: Auth + read earliest_restore_date from production DB object
     sql_client   = authenticate()
     restore_time = get_latest_restore_point(sql_client)
 
