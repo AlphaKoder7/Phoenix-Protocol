@@ -18,7 +18,7 @@ from datetime import timezone
 import pyodbc
 from azure.identity import ClientSecretCredential
 from azure.mgmt.sql import SqlManagementClient
-from azure.mgmt.sql.models import Database, Sku
+from azure.mgmt.sql.models import Database
 
 # ──────────────────────────────────────────────────────────────
 # Configuration — loaded entirely from environment variables
@@ -52,6 +52,11 @@ DRILL_SQL_SERVER_FQDN = _require_env("DRILL_SQL_SERVER_FQDN")
 SQL_ADMIN_USERNAME = _require_env("SQL_ADMIN_USERNAME")
 SQL_ADMIN_PASSWORD = _require_env("SQL_ADMIN_PASSWORD")
 
+# Azure region for the drill server.
+# Must match the Terraform `location` variable (default: "West US 2").
+# Override by setting the DRILL_LOCATION environment variable.
+DRILL_LOCATION = os.environ.get("DRILL_LOCATION", "West US 2")
+
 # Name of the restored database on the drill server
 DRILL_DB_NAME = "phoenix-drill-db"
 
@@ -79,11 +84,17 @@ def authenticate() -> SqlManagementClient:
 def get_latest_restore_point(client: SqlManagementClient) -> object:
     """
     Query the production database's restore points and return the most recent one.
-    Raises RuntimeError if no restore points are available.
+
+    Restore points whose `restore_point_creation_date` is None are silently
+    skipped — this happens when the initial Azure backup is still being generated
+    (the object exists in the list but the timestamp has not been populated yet).
+
+    Raises RuntimeError if no restore points exist at all, or if every restore
+    point has a null creation date (backup generation still in progress).
     """
     print(f"[STEP A] Fetching restore points for '{PROD_DB_NAME}' on '{PROD_SQL_SERVER_NAME}'...")
 
-    restore_points = list(
+    all_restore_points = list(
         client.restore_points.list_by_database(
             resource_group_name=PROD_RESOURCE_GROUP,
             server_name=PROD_SQL_SERVER_NAME,
@@ -91,17 +102,41 @@ def get_latest_restore_point(client: SqlManagementClient) -> object:
         )
     )
 
-    if not restore_points:
+    if not all_restore_points:
         raise RuntimeError(
             f"No restore points found for database '{PROD_DB_NAME}'. "
-            "Ensure the production database has backups enabled and has been running long enough to generate a restore point."
+            "Ensure the production database has backups enabled and has been "
+            "running long enough to generate a restore point."
         )
 
-    # Sort by restore_point_creation_date descending and take the latest
-    latest = max(restore_points, key=lambda rp: rp.restore_point_creation_date)
+    # Filter out entries where the timestamp is None (backup still generating)
+    valid_restore_points = [
+        rp for rp in all_restore_points
+        if rp.restore_point_creation_date is not None
+    ]
+
+    total   = len(all_restore_points)
+    skipped = total - len(valid_restore_points)
+    if skipped:
+        print(
+            f"[STEP A] Skipped {skipped}/{total} restore point(s) with a null "
+            "creation date (initial backup still generating)."
+        )
+
+    # Guard: if every restore point had a null date, bail with a clear message
+    if not valid_restore_points:
+        raise RuntimeError(
+            f"All {total} restore point(s) for '{PROD_DB_NAME}' have a null "
+            "restore_point_creation_date. The initial Azure backup is still being "
+            "generated. Re-run the drill once the first backup completes "
+            "(typically within 60 minutes of database creation)."
+        )
+
+    # Pick the most recent valid restore point
+    latest = max(valid_restore_points, key=lambda rp: rp.restore_point_creation_date)
     restore_time = latest.restore_point_creation_date
 
-    # Ensure the datetime is timezone-aware (Azure SDK returns UTC)
+    # Ensure the datetime is timezone-aware (Azure SDK returns UTC-naive datetimes)
     if restore_time.tzinfo is None:
         restore_time = restore_time.replace(tzinfo=timezone.utc)
 
@@ -117,10 +152,20 @@ def trigger_restore(client: SqlManagementClient, restore_time: object) -> None:
     """
     Restore the production database to the drill SQL Server using
     CreateMode=PointInTimeRestore. Blocks until the operation completes.
+
+    Notes on Azure SDK parameter names (azure-mgmt-sql >= 3.x):
+    - `create_mode`          : "PointInTimeRestore"
+    - `source_database_id`   : full ARM resource ID of the source database
+    - `restore_point_in_time`: timezone-aware datetime object
+    - `sku`                  : intentionally omitted — the SDK rejects a Sku
+                               override during a cross-server PointInTimeRestore.
+                               The restored database inherits the source SKU and
+                               can be scaled independently after the restore.
     """
     print(f"[STEP B] Triggering restore to '{DRILL_SQL_SERVER_NAME}' / '{DRILL_DB_NAME}'...")
-    print(f"[STEP B] Source: {PROD_SQL_SERVER_NAME}/{PROD_DB_NAME}")
+    print(f"[STEP B] Source:        {PROD_SQL_SERVER_NAME}/{PROD_DB_NAME}")
     print(f"[STEP B] Restore point: {restore_time.isoformat()}")
+    print(f"[STEP B] Target region: {DRILL_LOCATION}")
     print("[STEP B] This operation can take 5–15 minutes. Waiting...")
 
     # Build the ARM resource ID of the source (production) database
@@ -132,11 +177,11 @@ def trigger_restore(client: SqlManagementClient, restore_time: object) -> None:
     )
 
     restore_params = Database(
-        location="East US",           # Must match the drill server's region
+        location=DRILL_LOCATION,
         create_mode="PointInTimeRestore",
         source_database_id=source_db_id,
         restore_point_in_time=restore_time,
-        sku=Sku(name="Basic", tier="Basic"),  # Cheapest tier — satisfies cost NFR
+        # SKU is deliberately omitted — see docstring above.
     )
 
     # begin_create_or_update returns a LROPoller; .result() blocks until done
@@ -146,7 +191,7 @@ def trigger_restore(client: SqlManagementClient, restore_time: object) -> None:
         database_name=DRILL_DB_NAME,
         parameters=restore_params,
     )
-    poller.result()  # Blocks — raises an exception if the operation fails
+    poller.result()  # Blocks — raises CloudError / HttpResponseError if op fails
 
     print(f"[STEP B] Restore complete. Database '{DRILL_DB_NAME}' is ready.")
 
@@ -157,15 +202,23 @@ def trigger_restore(client: SqlManagementClient, restore_time: object) -> None:
 
 def verify_data_integrity() -> None:
     """
-    Connect to the restored database using pyodbc (ODBC Driver 18) and
-    assert that the Users table contains at least EXPECTED_ROW_THRESHOLD rows.
-    Raises AssertionError on failure.
+    Connect to the restored database using pyodbc (ODBC Driver 18 for SQL Server)
+    and assert that the Users table contains at least EXPECTED_ROW_THRESHOLD rows.
+
+    Connection string notes:
+    - SERVER   : Use the FQDN (e.g. my-server.database.windows.net) — works for
+                 both Azure SQL Server (PaaS) and Azure SQL Managed Instance.
+    - Encrypt  : Must be 'yes' — ODBC Driver 18 enforces encryption by default,
+                 but being explicit makes the requirement clear.
+    - TrustServerCertificate=no : Forces validation of the server certificate
+                                   against trusted CAs (Microsoft's PKI).
+    - Connection Timeout : 30-second limit before raising a connection error.
     """
     print(f"[STEP C] Connecting to '{DRILL_SQL_SERVER_FQDN}' / '{DRILL_DB_NAME}' via pyodbc...")
 
     connection_string = (
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={DRILL_SQL_SERVER_FQDN};"
+        f"SERVER={DRILL_SQL_SERVER_FQDN},1433;"
         f"DATABASE={DRILL_DB_NAME};"
         f"UID={SQL_ADMIN_USERNAME};"
         f"PWD={SQL_ADMIN_PASSWORD};"
@@ -204,7 +257,7 @@ def main() -> None:
     start_time = time.time()
 
     # Step A: Auth + identify restore point
-    sql_client = authenticate()
+    sql_client   = authenticate()
     restore_time = get_latest_restore_point(sql_client)
 
     # Step B: Restore
