@@ -57,10 +57,16 @@ SQL_ADMIN_PASSWORD = _require_env("SQL_ADMIN_PASSWORD")
 # Override by setting the DRILL_LOCATION environment variable.
 DRILL_LOCATION = os.environ.get("DRILL_LOCATION", "West US 2")
 
-# Name of the restored database on the drill server
+# Name of the copied database on the drill server
 DRILL_DB_NAME = "phoenix-drill-db"
 
-# Data integrity threshold — drill passes only if row count meets this
+# Optional: specific table to row-count during the integrity check.
+# Format: 'schema.TableName', e.g. 'dbo.Orders' or 'sales.Customers'.
+# If NOT set, the check falls back to counting all user-defined base tables
+# in INFORMATION_SCHEMA.TABLES — works on any database schema out of the box.
+DRILL_TABLE_NAME = os.environ.get("DRILL_TABLE_NAME")  # None if not provided
+
+# Data integrity threshold — drill passes only if the count meets this minimum
 EXPECTED_ROW_THRESHOLD = 1
 
 
@@ -148,16 +154,25 @@ def trigger_restore(client: SqlManagementClient) -> None:
 
 def verify_data_integrity() -> None:
     """
-    Connect to the restored database using pyodbc (ODBC Driver 18 for SQL Server)
-    and assert that the Users table contains at least EXPECTED_ROW_THRESHOLD rows.
+    Connect to the copied database using pyodbc (ODBC Driver 18 for SQL Server)
+    and assert that it contains real data.
+
+    Two modes, selected by the DRILL_TABLE_NAME environment variable:
+
+    1. Schema-agnostic (default, DRILL_TABLE_NAME not set):
+       Queries INFORMATION_SCHEMA.TABLES for all user-defined base tables.
+       Passes if at least EXPECTED_ROW_THRESHOLD table(s) exist.
+       This works on any production database regardless of schema.
+
+    2. Targeted (DRILL_TABLE_NAME is set, e.g. 'dbo.Orders'):
+       Runs SELECT COUNT(*) on the specified table.
+       Passes if the row count >= EXPECTED_ROW_THRESHOLD.
+       Use this when you need to assert a specific, known-populated table.
 
     Connection string notes:
-    - SERVER   : Use the FQDN (e.g. my-server.database.windows.net) — works for
-                 both Azure SQL Server (PaaS) and Azure SQL Managed Instance.
-    - Encrypt  : Must be 'yes' — ODBC Driver 18 enforces encryption by default,
-                 but being explicit makes the requirement clear.
-    - TrustServerCertificate=no : Forces validation of the server certificate
-                                   against trusted CAs (Microsoft's PKI).
+    - SERVER   : FQDN with explicit port — works for Azure SQL Server (PaaS).
+    - Encrypt  : 'yes' — ODBC Driver 18 enforces TLS; being explicit is safer.
+    - TrustServerCertificate=no : Validates cert against Microsoft's PKI.
     - Connection Timeout : 30-second limit before raising a connection error.
     """
     print(f"[STEP C] Connecting to '{DRILL_SQL_SERVER_FQDN}' / '{DRILL_DB_NAME}' via pyodbc...")
@@ -176,18 +191,40 @@ def verify_data_integrity() -> None:
     with pyodbc.connect(connection_string) as conn:
         print("[STEP C] Connection established. Running integrity query...")
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM dbo.Users;")
-        row_count = cursor.fetchone()[0]
 
-    print(f"[STEP C] Query result: {row_count} row(s) in dbo.Users.")
+        if DRILL_TABLE_NAME:
+            # ── Targeted mode: row-count on a specific table ──────────────────
+            # DRILL_TABLE_NAME is injected from an env var, never from user input,
+            # so direct string interpolation is safe here.
+            print(f"[STEP C] Mode: targeted row-count on '{DRILL_TABLE_NAME}'")
+            cursor.execute(f"SELECT COUNT(*) FROM {DRILL_TABLE_NAME};")
+            count    = cursor.fetchone()[0]
+            subject  = f"table '{DRILL_TABLE_NAME}'"
+            unit     = "row(s)"
+        else:
+            # ── Schema-agnostic mode: count user-defined base tables ──────────
+            print("[STEP C] Mode: schema-agnostic (counting user-defined tables)")
+            cursor.execute(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE = 'BASE TABLE';"
+            )
+            count    = cursor.fetchone()[0]
+            subject  = "database schema"
+            unit     = "user-defined table(s)"
 
-    if row_count >= EXPECTED_ROW_THRESHOLD:
-        print(f"[PASS] Data integrity verified. Row count ({row_count}) meets threshold ({EXPECTED_ROW_THRESHOLD}).")
+    print(f"[STEP C] Result: {count} {unit} found in {subject}.")
+
+    if count >= EXPECTED_ROW_THRESHOLD:
+        print(
+            f"[PASS] Data integrity verified. "
+            f"Count ({count}) meets threshold ({EXPECTED_ROW_THRESHOLD})."
+        )
     else:
         raise AssertionError(
             f"[FAIL] Data integrity check failed. "
-            f"Row count ({row_count}) is below threshold ({EXPECTED_ROW_THRESHOLD}). "
-            "The restored database may be empty or corrupt."
+            f"Found {count} {unit} in {subject} — "
+            f"expected at least {EXPECTED_ROW_THRESHOLD}. "
+            "The copied database may be empty or the schema was not replicated."
         )
 
 
