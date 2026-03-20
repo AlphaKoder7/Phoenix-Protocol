@@ -2,8 +2,8 @@
 drill_master.py — Phoenix Protocol Core Script
 ================================================
 Performs the "Game Day" DR drill cycle:
-  Step A: Read earliest_restore_date from the Production database object.
-  Step B: Restore it to the ephemeral Drill SQL Server.
+  Step A: Authenticate to Azure.
+  Step B: Copy the Production database to the ephemeral Drill SQL Server.
   Step C: Verify data integrity via a row-count query.
 
 All configuration is read from environment variables — no hardcoded values.
@@ -13,7 +13,7 @@ Exit codes: 0 = PASS, 1 = FAIL
 import os
 import sys
 import time
-from datetime import timezone
+# (timezone import removed — no longer needed after switching to Database Copy)
 
 import pyodbc
 from azure.identity import ClientSecretCredential
@@ -65,7 +65,7 @@ EXPECTED_ROW_THRESHOLD = 1
 
 
 # ──────────────────────────────────────────────────────────────
-# Step A: Authenticate & Identify PITR Target Time
+# Step A: Authenticate
 # ──────────────────────────────────────────────────────────────
 
 def authenticate() -> SqlManagementClient:
@@ -81,74 +81,40 @@ def authenticate() -> SqlManagementClient:
     return client
 
 
-def get_latest_restore_point(client: SqlManagementClient) -> object:
-    """
-    Return the PITR target time for the production database.
-
-    Reads `earliest_restore_date` directly from the Database object via
-    `databases.get()`. This property is the canonical, authoritative timestamp
-    that the Azure Portal also surfaces, and is always consistent with the
-    service's internal PITR window — unlike `restore_points.list_by_database()`,
-    which can return objects with a null `restore_point_creation_date` while the
-    initial backup is still being written.
-
-    Raises RuntimeError if `earliest_restore_date` is None, meaning the
-    production database has not yet completed its first automated backup.
-    """
-    print(
-        f"[STEP A] Fetching database object for '{PROD_DB_NAME}' "
-        f"on '{PROD_SQL_SERVER_NAME}'..."
-    )
-
-    prod_db = client.databases.get(
-        resource_group_name=PROD_RESOURCE_GROUP,
-        server_name=PROD_SQL_SERVER_NAME,
-        database_name=PROD_DB_NAME,
-    )
-
-    restore_time = prod_db.earliest_restore_date
-
-    if restore_time is None:
-        raise RuntimeError(
-            f"'earliest_restore_date' is None for database '{PROD_DB_NAME}'. "
-            "The initial Azure automated backup has not yet completed. "
-            "Re-run the drill once the first backup finishes "
-            "(typically within 60 minutes of database creation)."
-        )
-
-    # Ensure the datetime is timezone-aware (Azure SDK returns UTC-naive datetimes)
-    if restore_time.tzinfo is None:
-        restore_time = restore_time.replace(tzinfo=timezone.utc)
-
-    print(f"[STEP A] PITR target time (earliest_restore_date): {restore_time.isoformat()}")
-    return restore_time
-
-
 # ──────────────────────────────────────────────────────────────
-# Step B: Trigger Point-in-Time Restore
+# Step B: Copy Production Database to Drill Server
 # ──────────────────────────────────────────────────────────────
 
-def trigger_restore(client: SqlManagementClient, restore_time: object) -> None:
+def trigger_restore(client: SqlManagementClient) -> None:
     """
-    Restore the production database to the drill SQL Server using
-    CreateMode=PointInTimeRestore. Blocks until the operation completes.
+    Copy the production database to the ephemeral drill SQL Server using
+    create_mode='Copy'. Blocks until the operation completes.
 
-    Notes on Azure SDK parameter names (azure-mgmt-sql >= 3.x):
-    - `create_mode`          : "PointInTimeRestore"
-    - `source_database_id`   : full ARM resource ID of the source database
-    - `restore_point_in_time`: timezone-aware datetime object
-    - `sku`                  : intentionally omitted — the SDK rejects a Sku
-                               override during a cross-server PointInTimeRestore.
-                               The restored database inherits the source SKU and
-                               can be scaled independently after the restore.
+    Why 'Copy' and not 'PointInTimeRestore':
+      Azure SQL Database (PaaS / logical server) enforces RestoreCrossServerDisabled
+      — PITR can only target the same logical server as the source. Since Phoenix
+      Protocol intentionally provisions a separate, ephemeral drill server via
+      Terraform, PITR is architecturally incompatible with this design.
+
+      create_mode='Copy' has no such restriction. It produces a transactionally
+      consistent snapshot of the source database at the moment the copy begins,
+      places it on the drill server, and leaves it fully independent — which is
+      exactly what a DR data-integrity drill requires.
+
+    Azure SDK parameter names (azure-mgmt-sql >= 3.x):
+      - create_mode       : 'Copy'
+      - source_database_id: full ARM resource ID of the source (production) database
+      - location          : must match the drill server's Azure region
+      - sku               : omitted — Copy inherits the source SKU automatically
+      - restore_point_in_time: not applicable for Copy mode
     """
-    print(f"[STEP B] Triggering restore to '{DRILL_SQL_SERVER_NAME}' / '{DRILL_DB_NAME}'...")
+    print(f"[STEP B] Starting database copy to '{DRILL_SQL_SERVER_NAME}' / '{DRILL_DB_NAME}'...")
     print(f"[STEP B] Source:        {PROD_SQL_SERVER_NAME}/{PROD_DB_NAME}")
-    print(f"[STEP B] Restore point: {restore_time.isoformat()}")
+    print(f"[STEP B] Mode:          Copy (transactionally consistent snapshot)")
     print(f"[STEP B] Target region: {DRILL_LOCATION}")
     print("[STEP B] This operation can take 5–15 minutes. Waiting...")
 
-    # Build the ARM resource ID of the source (production) database
+    # Full ARM resource ID of the source (production) database
     source_db_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}"
         f"/resourceGroups/{PROD_RESOURCE_GROUP}"
@@ -156,24 +122,24 @@ def trigger_restore(client: SqlManagementClient, restore_time: object) -> None:
         f"/databases/{PROD_DB_NAME}"
     )
 
-    restore_params = Database(
+    copy_params = Database(
         location=DRILL_LOCATION,
-        create_mode="PointInTimeRestore",
+        create_mode="Copy",
         source_database_id=source_db_id,
-        restore_point_in_time=restore_time,
-        # SKU is deliberately omitted — see docstring above.
+        # restore_point_in_time is not used for Copy mode.
+        # SKU is omitted — Copy inherits it from the source automatically.
     )
 
-    # begin_create_or_update returns a LROPoller; .result() blocks until done
+    # begin_create_or_update returns an LROPoller; .result() blocks until done
     poller = client.databases.begin_create_or_update(
         resource_group_name=DRILL_RESOURCE_GROUP,
         server_name=DRILL_SQL_SERVER_NAME,
         database_name=DRILL_DB_NAME,
-        parameters=restore_params,
+        parameters=copy_params,
     )
-    poller.result()  # Blocks — raises CloudError / HttpResponseError if op fails
+    poller.result()  # Blocks — raises HttpResponseError if the operation fails
 
-    print(f"[STEP B] Restore complete. Database '{DRILL_DB_NAME}' is ready.")
+    print(f"[STEP B] Copy complete. Database '{DRILL_DB_NAME}' is ready on drill server.")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -236,12 +202,11 @@ def main() -> None:
 
     start_time = time.time()
 
-    # Step A: Auth + read earliest_restore_date from production DB object
-    sql_client   = authenticate()
-    restore_time = get_latest_restore_point(sql_client)
+    # Step A: Authenticate
+    sql_client = authenticate()
 
-    # Step B: Restore
-    trigger_restore(sql_client, restore_time)
+    # Step B: Copy production DB to the ephemeral drill server
+    trigger_restore(sql_client)
 
     # Step C: Verify
     verify_data_integrity()
