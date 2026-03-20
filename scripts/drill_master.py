@@ -97,9 +97,9 @@ def get_latest_restore_point(client: SqlManagementClient) -> object:
             "Ensure the production database has backups enabled and has been running long enough to generate a restore point."
         )
 
-    # Sort by restore_point_creation_time descending and take the latest
-    latest = max(restore_points, key=lambda rp: rp.restore_point_creation_time)
-    restore_time = latest.restore_point_creation_time
+    # Sort by restore_point_creation_date descending and take the latest
+    latest = max(restore_points, key=lambda rp: rp.restore_point_creation_date)
+    restore_time = latest.restore_point_creation_date
 
     # Ensure the datetime is timezone-aware (Azure SDK returns UTC)
     if restore_time.tzinfo is None:
