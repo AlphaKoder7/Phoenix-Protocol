@@ -1,4 +1,4 @@
-# 🔥 The Phoenix Protocol
+# The Phoenix Protocol
 ### *Because a backup you've never tested isn't a backup — it's a liability.*
 
 > An automated, zero-cost, serverless pipeline that **rises from the ashes every week** to prove your database can be restored — then vanishes without a trace.
@@ -24,33 +24,33 @@
 
 ---
 
-## 🚨 The Problem
+## The Problem
 
 Organizations trust their backups, but almost never **test** them. This creates a phenomenon known as **Silent Data Corruption** — a false sense of security where backups exist on paper but are unverifiable in practice.
 
 Manual verification is:
-- 💸 **Expensive** — it requires dedicated engineers and infrastructure.
-- 🐢 **Slow** — setting up a test environment takes hours.
-- ❌ **Error-prone** — human steps lead to inconsistent results.
+- **Expensive** — it requires dedicated engineers and infrastructure.
+- **Slow** — setting up a test environment takes hours.
+- **Error-prone** — human steps lead to inconsistent results.
 
 The consequence? When disaster strikes and a restore is actually needed, you discover the backup was broken all along.
 
 ---
 
-## ✅ The Solution
+## The Solution
 
 **The Phoenix Protocol** is a fully automated **Disaster Recovery (DR) drill pipeline** that runs on a weekly schedule. It:
 
-1. 🏗️ **Spins up** a temporary, isolated Azure environment from scratch using Terraform.
-2. 🗄️ **Restores** your production database to that environment using Azure's point-in-time restore API.
-3. 🔬 **Verifies** the restored data is alive and correct by running a live SQL query.
-4. 💣 **Destroys** every resource it created — with zero idle costs remaining.
+1. **Spins up** a temporary, isolated Azure environment from scratch using Terraform.
+2. **Restores** your production database to that environment using Azure's point-in-time restore API.
+3. **Verifies** the restored data is alive and correct by running a live SQL query.
+4. **Destroys** every resource it created — with zero idle costs remaining.
 
 All of this happens automatically. **Zero human touch required.**
 
 ---
 
-## 🏛️ Architecture
+## Architecture
 
 ### Ephemeral Infrastructure Pattern
 
@@ -70,9 +70,9 @@ The Phoenix Protocol is built on the **Ephemeral Infrastructure** pattern — in
 ```
 
 **Why Ephemeral?**
-- 🔒 **Security** — the drill environment is fully isolated from production.
-- 💰 **Cost** — resources exist for `< 20 minutes`, keeping the cost per run under **$0.05 USD**.
-- 🧼 **Hygiene** — no zombie resources, no configuration drift, no surprises.
+- **Security** — the drill environment is fully isolated from production.
+- **Cost** — resources exist for `< 20 minutes`, keeping the cost per run under **$0.05 USD**.
+- **Hygiene** — no zombie resources, no configuration drift, no surprises.
 
 The `terraform destroy` step runs under `if: always()` in GitHub Actions — **even if the verification step crashes**, the cleanup is guaranteed.
 
@@ -228,7 +228,7 @@ pip install -r requirements.txt
 
 ## 🔁 The Four Phases Explained
 
-### Phase 1 — Build 🏗️
+### Phase 1 — Build 
 `terraform apply` creates two Azure resources inside an isolated resource group:
 - **Resource Group:** `rg-phoenix-drill-{run_id}` — acts as a blast radius boundary.
 - **SQL Server (Logical):** `sql-phoenix-{run_id}` — the target server for the restore.
@@ -236,20 +236,20 @@ pip install -r requirements.txt
 
 Terraform **outputs** the `sql_server_fqdn` and `resource_group_name` for use by the Python script.
 
-### Phase 2 — Restore 🗄️
+### Phase 2 — Restore 
 `drill_master.py` uses `azure-mgmt-sql` to:
 1. Locate the **source Production database** within its resource group.
 2. Identify its **latest valid restore point** (`earliestRestoreDate`).
 3. Issue a `CreateMode=Restore` API call — letting Azure create the drill database *during* the restore operation (no empty DB is pre-created).
 
-### Phase 3 — Verify 🔬
+### Phase 3 — Verify 
 Once the restore completes, the script:
 1. Connects to the new drill database via `pyodbc` using ODBC Driver 18.
 2. Executes: `SELECT COUNT(*) FROM dbo.Users;`
 3. **Asserts** the row count meets the expected threshold (`>= 1` by default).
 4. Logs **PASS** ✅ or **FAIL** ❌ to the GitHub Actions console.
 
-### Phase 4 — Cleanup 💣
+### Phase 4 — Cleanup 
 `terraform destroy -auto-approve` tears down the entire `rg-phoenix-drill-{run_id}` resource group and every resource within it.
 
 - Runs with `if: always()` — **this step cannot be skipped**, even on upstream failure.
@@ -257,7 +257,7 @@ Once the restore completes, the script:
 
 ---
 
-## 📊 Success Metrics
+## Success Metrics
 
 | Metric | Target |
 |---|---|
@@ -268,7 +268,7 @@ Once the restore completes, the script:
 
 ---
 
-## 🚀 Future Roadmap
+## Future Roadmap
 
 - [ ] **Alerting Integration** — Send Pass/Fail results to Slack or Email via webhooks.
 - [ ] **Multi-Table Verification** — Extend assertions beyond a single Users table count.
